@@ -179,8 +179,8 @@ def process_ticker(ticker: str, sites: List[str], run_vader: bool, run_finbert: 
     Fetch headlines and run sentiment analyzers; return counts:
     {
       'ticker': ticker,
-      'vader_pos': int, 'vader_neg': int,
-      'finbert_pos': int, 'finbert_neg': int
+      'vader_pos': int, 'vader_neg': int, 'vader_neu': int,
+      'finbert_pos': int, 'finbert_neg': int, 'finbert_neu': int
     }
     """
     ticker = ticker.strip().upper()
@@ -188,8 +188,8 @@ def process_ticker(ticker: str, sites: List[str], run_vader: bool, run_finbert: 
     vader = load_vader() if run_vader else None
     finbert = load_finbert_pipeline() if run_finbert else None
 
-    vpos = vneg = 0
-    fpos = fneg = 0
+    vpos = vneg = vneu = 0
+    fpos = fneg = fneu = 0
 
     for h in headlines:
         if run_vader and vader:
@@ -198,21 +198,28 @@ def process_ticker(ticker: str, sites: List[str], run_vader: bool, run_finbert: 
                 vpos += 1
             elif res == "negative":
                 vneg += 1
+            else:
+                vneu += 1
         if run_finbert and finbert:
             res = analyze_finbert(finbert, h)
             if res == "positive":
                 fpos += 1
             elif res == "negative":
                 fneg += 1
+            else:
+                fneu += 1
 
     return {
         "ticker": ticker,
         "vader_pos": vpos,
         "vader_neg": vneg,
+        "vader_neu": vneu,
         "finbert_pos": fpos,
         "finbert_neg": fneg,
+        "finbert_neu": fneu,
         "n_headlines": len(headlines)
     }
+
 
 # -----------------------
 # Streamlit UI
@@ -336,7 +343,12 @@ if run_button:
 
         # Build DataFrame
         df_res = pd.DataFrame(results).set_index("ticker")
-        df_res = df_res[["vader_pos", "vader_neg", "finbert_pos", "finbert_neg", "n_headlines"]]
+        df_res = df_res[
+            ["vader_pos", "vader_neg", "vader_neu",
+             "finbert_pos", "finbert_neg", "finbert_neu",
+             "n_headlines"]
+        ]
+
 
         # Color the ticker labels based on counts: mostly positive => green, mostly negative => red
         def color_row(ticker, row):
@@ -390,7 +402,11 @@ if run_button:
             return table
 
         # Reformat display columns order
-        display_df = display_df[["ticker", "vader_pos", "vader_neg", "finbert_pos", "finbert_neg", "n_headlines"]]
+        display_df = display_df[
+            ["ticker", "vader_pos", "vader_neg", "vader_neu",
+             "finbert_pos", "finbert_neg", "finbert_neu", "n_headlines"]
+        ]
+
         html_table = make_html_table(display_df)
         st.markdown(html_table, unsafe_allow_html=True)
 
