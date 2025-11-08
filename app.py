@@ -513,25 +513,62 @@ if run_button:
                     "finbert": fin_label
                 })
 
-        # Sort detailed rows by timestamp when possible (items without timestamp go last)
-        def ts_sort_key(row):
-            ts = row.get("timestamp", "")
-            # try simple patterns: RFC-822/pubDate or relative times — we cannot reliably parse all formats,
-            # so prefer rows with non-empty ts (they'll appear first). Preserve original order otherwise.
-            return (0 if ts else 1, ts)
-        detail_rows_sorted = sorted(detail_rows, key=ts_sort_key)
+                # -----------------------
+        # Detailed headlines table (with timestamp and colored sentiments)
+        # -----------------------
+        st.subheader("All headlines (detailed) — grouped by ticker and sorted by time")
 
-        # Build HTML table for details
+        def sentiment_color_label(label: str) -> str:
+            if label == "positive":
+                return "<span style='color:green;font-weight:bold'>positive</span>"
+            elif label == "negative":
+                return "<span style='color:red;font-weight:bold'>negative</span>"
+            elif label == "neutral":
+                return "<span style='color:orange;font-weight:bold'>neutral</span>"
+            else:
+                return "<span style='color:gray'>n/a</span>"
+
+        # Build all detailed rows
+        detail_rows = []
+        for r in results:
+            tkr = r["ticker"]
+            for h in r.get("headlines", []):
+                detail_rows.append({
+                    "ticker": tkr,
+                    "source": h.get("source", ""),
+                    "title": h.get("title", ""),
+                    "link": h.get("link", ""),
+                    "timestamp": h.get("timestamp", "") or "",
+                    "vader": h.get("vader", "n/a"),
+                    "finbert": h.get("finbert", "n/a")
+                })
+
+        # Group by ticker, then sort each group by timestamp (descending if possible)
+        def timestamp_key(ts: str):
+            # Simple heuristic: prioritize filled timestamps, keep string order otherwise
+            if not ts:
+                return (0, "")
+            return (1, ts)
+
+        grouped_rows = []
+        for ticker in sorted({r["ticker"] for r in detail_rows}):
+            subset = [r for r in detail_rows if r["ticker"] == ticker]
+            subset_sorted = sorted(subset, key=lambda x: timestamp_key(x["timestamp"]), reverse=True)
+            grouped_rows.extend(subset_sorted)
+
+        # Build HTML table for grouped detail view
         def make_detail_html(rows):
-            header = "<tr>" \
-                     "<th style='padding:8px;text-align:left'>Ticker</th>" \
-                     "<th style='padding:8px;text-align:left'>Timestamp</th>" \
-                     "<th style='padding:8px;text-align:left'>Source</th>" \
-                     "<th style='padding:8px;text-align:left'>Headline</th>" \
-                     "<th style='padding:8px;text-align:left'>VADER</th>" \
-                     "<th style='padding:8px;text-align:left'>FinBERT</th>" \
-                     "</tr>"
-            row_html = []
+            header = (
+                "<tr>"
+                "<th style='padding:8px;text-align:left'>Ticker</th>"
+                "<th style='padding:8px;text-align:left'>Timestamp</th>"
+                "<th style='padding:8px;text-align:left'>Source</th>"
+                "<th style='padding:8px;text-align:left'>Headline</th>"
+                "<th style='padding:8px;text-align:left'>VADER</th>"
+                "<th style='padding:8px;text-align:left'>FinBERT</th>"
+                "</tr>"
+            )
+            html_rows = []
             for r in rows:
                 ticker = html.escape(r["ticker"])
                 ts = html.escape(r.get("timestamp", ""))
@@ -545,18 +582,17 @@ if run_button:
                     headline_cell = title
                 vader_col = sentiment_color_label(r.get("vader", "n/a"))
                 fin_col = sentiment_color_label(r.get("finbert", "n/a"))
-                row_html.append(f"<tr>"
-                                f"<td style='padding:6px'>{ticker}</td>"
-                                f"<td style='padding:6px'>{ts}</td>"
-                                f"<td style='padding:6px'>{source}</td>"
-                                f"<td style='padding:6px'>{headline_cell}</td>"
-                                f"<td style='padding:6px'>{vader_col}</td>"
-                                f"<td style='padding:6px'>{fin_col}</td>"
-                                f"</tr>")
-            table = f"<table style='border-collapse: collapse; width:100%'>{header}{''.join(row_html)}</table>"
+                html_rows.append(
+                    f"<tr>"
+                    f"<td style='padding:6px'>{ticker}</td>"
+                    f"<td style='padding:6px'>{ts}</td>"
+                    f"<td style='padding:6px'>{source}</td>"
+                    f"<td style='padding:6px'>{headline_cell}</td>"
+                    f"<td style='padding:6px'>{vader_col}</td>"
+                    f"<td style='padding:6px'>{fin_col}</td>"
+                    f"</tr>"
+                )
+            table = f"<table style='border-collapse: collapse; width:100%'>{header}{''.join(html_rows)}</table>"
             return table
 
-        st.markdown(make_detail_html(detail_rows_sorted), unsafe_allow_html=True)
-
-        t_elapsed = time.time() - t0
-        st.success(f"Done — processed {len(results)} tickers in {t_elapsed:.1f} s. Headlines per ticker (deduped): see 'n_headlines' column in summary.")
+        st.markdown(make_detail_html(grouped_rows), unsafe_allow_html=True)
