@@ -1,3 +1,4 @@
+# app.py
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
@@ -8,15 +9,15 @@ from typing import List, Dict, Tuple
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from transformers import pipeline
 import time
+import html
+import re
 
 # -----------------------
 # Config
 # -----------------------
-NEWS_PER_SITE = 10
-REQUEST_TIMEOUT = 10  # seconds
-MAX_TICKERS = 30  # safety limit for UI (you can change)
-
 st.set_page_config(page_title="Ticker News Sentiment", layout="wide")
+REQUEST_TIMEOUT = 10  # seconds
+MAX_TICKERS = 30
 
 # -----------------------
 # Caching: heavy resources
@@ -27,13 +28,11 @@ def load_vader():
 
 @st.cache_resource(show_spinner=True)
 def load_finbert_pipeline():
-    # Use a FinBERT tone model that returns positive/negative/neutral labels
-    # This will download the model the first time it's run.
-    # Model choice: 'yiyanghkust/finbert-tone' often used for finance tone classification
+    # FinBERT / finance tone classifier (may download first time)
     return pipeline("text-classification", model="yiyanghkust/finbert-tone", device=-1)
 
 # -----------------------
-# Utilities: scraping functions
+# Networking helper
 # -----------------------
 def fetch_url(url: str, headers=None, params=None) -> requests.Response:
     headers = headers or {"User-Agent": "Mozilla/5.0"}
@@ -41,65 +40,143 @@ def fetch_url(url: str, headers=None, params=None) -> requests.Response:
     resp.raise_for_status()
     return resp
 
-def parse_finviz(ticker: str, max_items: int = NEWS_PER_SITE) -> List[str]:
+# -----------------------
+# Parsers (return dicts with title, link, source, timestamp)
+# -----------------------
+def parse_finviz(ticker: str, max_items: int = 10) -> List[Dict]:
     """
-    Finviz has a news section for each ticker: https://finviz.com/quote.ashx?t=AAPL
-    We'll parse the news table and extract headlines (text).
+    Parse finviz news table. Returns list of {"title","link","source":"finviz","timestamp": "..."}.
+    Finviz usually lists rows where the date/time may appear in the first td and the anchor in the second.
     """
-    url = f"https://finviz.com/quote.ashx"
+    url = "https://finviz.com/quote.ashx"
     params = {"t": ticker}
     try:
         resp = fetch_url(url, params=params)
     except Exception:
         return []
     soup = BeautifulSoup(resp.text, "html.parser")
-    # news table rows appear in the 'news-table' id/class
     news_table = soup.find("table", class_="fullview-news-outer")
     if not news_table:
         return []
-    headlines = []
-    for a in news_table.find_all("a"):
-        txt = a.get_text(strip=True)
-        if txt:
-            headlines.append(txt)
-        if len(headlines) >= max_items:
-            break
-    return headlines
+    results = []
+    # Finviz places news in rows: <tr><td>DATE/TIME</td><td><a>headline</a></td></tr>
+    for tr in news_table.find_all("tr"):
+        tds = tr.find_all("td")
+        if not tds:
+            continue
+        # sometimes date/time is in first td, headline anchor in second
+        timestamp = ""
+        title = ""
+        link = ""
+        if len(tds) == 2:
+            ts_text = tds[0].get_text(strip=True)
+            timestamp = ts_text
+            a = tds[1].find("a")
+            if a:
+                title = a.get_text(strip=True)
+                href = a.get("href")
+                if href and href.startswith("http"):
+                    link = href
+                elif href:
+                    link = "https://finviz.com/" + href.lstrip("/")
+        else:
+            # fallback: find first anchor
+            a = tr.find("a")
+            if a:
+                title = a.get_text(strip=True)
+                href = a.get("href")
+                link = href if href and href.startswith("http") else ("https://finviz.com/" + href.lstrip("/") if href else "")
+        if title:
+            results.append({"title": title, "link": link, "source": "finviz", "timestamp": timestamp})
+            if len(results) >= max_items:
+                break
+    return results[:max_items]
 
-def parse_yahoo(ticker: str, max_items: int = NEWS_PER_SITE) -> List[str]:
+def parse_yahoo(ticker: str, max_items: int = 10) -> List[Dict]:
     """
-    Scrape Yahoo Finance news list for a ticker.
-    Example: https://finance.yahoo.com/quote/AAPL?p=AAPL
-    Headlines are in <h3> tags with data-test-locator or links.
+    Scrape Yahoo Finance news listing for a ticker.
+    Attempts to extract headline and time where available.
     """
-    url = f"https://finance.yahoo.com/quote/{urllib.parse.quote(ticker)}?p={urllib.parse.quote(ticker)}"
+    results = []
+    url = f"https://finance.yahoo.com/quote/{urllib.parse.quote(ticker)}/news?p={urllib.parse.quote(ticker)}"
     try:
         resp = fetch_url(url)
     except Exception:
-        return []
+        return results
     soup = BeautifulSoup(resp.text, "html.parser")
-    headlines = []
-    # Yahoo uses many structures. Try some fallbacks.
-    for h in soup.find_all(["h3", "h2"]):
-        txt = h.get_text(strip=True)
-        if txt and len(txt) > 5:
-            headlines.append(txt)
-        if len(headlines) >= max_items:
-            break
-    # If not enough, try the newsfeed area
-    if len(headlines) < max_items:
-        for a in soup.find_all("a"):
-            txt = a.get_text(strip=True)
-            if txt and len(txt) > 10 and txt not in headlines:
-                headlines.append(txt)
-            if len(headlines) >= max_items:
-                break
-    return headlines[:max_items]
 
-def parse_google_news(ticker: str, max_items: int = NEWS_PER_SITE) -> List[str]:
+    # Attempt to find news card blocks
+    # Yahoo structures change; try a few heuristics.
+    items = soup.select("li.js-stream-content, div[data-test-locator='mega'] a")  # broad selector
+    # If above didn't find good items, fall back to anchors
+    if not items:
+        anchors = soup.find_all("a")
+        for a in anchors:
+            txt = a.get_text(strip=True)
+            href = a.get("href")
+            if not txt or len(txt) < 10:
+                continue
+            if href and ("news" in href or href.startswith("/") or href.startswith("http")):
+                if href.startswith("/"):
+                    link = urllib.parse.urljoin("https://finance.yahoo.com", href)
+                else:
+                    link = href
+                # attempt to find a timestamp near the anchor
+                ts = ""
+                parent = a.parent
+                # look for time tag or span with 'time' or 'ago'
+                time_tag = parent.find("time") if parent else None
+                if time_tag:
+                    ts = time_tag.get_text(strip=True)
+                else:
+                    # look for sibling spans
+                    sib = a.find_next_sibling("span") or (parent.find("span") if parent else None)
+                    if sib:
+                        ts_text = sib.get_text(strip=True)
+                        # quick filter to avoid nav labels
+                        if re.search(r'\d', ts_text):
+                            ts = ts_text
+                results.append({"title": txt, "link": link, "source": "yahoo", "timestamp": ts})
+                if len(results) >= max_items:
+                    break
+    else:
+        for item in items:
+            a = item.find("a")
+            if not a:
+                continue
+            txt = a.get_text(strip=True)
+            href = a.get("href")
+            if not txt or len(txt) < 10:
+                continue
+            # link absolute
+            if href and href.startswith("/"):
+                link = urllib.parse.urljoin("https://finance.yahoo.com", href)
+            else:
+                link = href or ""
+            # search for time within the item
+            ts = ""
+            t = item.find("time")
+            if t:
+                ts = t.get_text(strip=True)
+            else:
+                # sometimes there's a small tag or span with time info
+                possible = item.find_all(["span", "small"])
+                for p in possible:
+                    txtp = p.get_text(strip=True)
+                    if txtp and re.search(r'\d', txtp):
+                        ts = txtp
+                        break
+            results.append({"title": txt, "link": link, "source": "yahoo", "timestamp": ts})
+            if len(results) >= max_items:
+                break
+
+    # final fallback: parse RSS via Yahoo's news endpoint is not straightforward; use what we found
+    return results[:max_items]
+
+def parse_google_news(ticker: str, max_items: int = 10) -> List[Dict]:
     """
-    Use Google News RSS: https://news.google.com/rss/search?q={ticker}
-    This is simple and stable.
+    Use Google News RSS for the search query.
+    Returns link, title, and pubDate if present.
     """
     query = urllib.parse.quote_plus(ticker)
     url = f"https://news.google.com/rss/search?q={query}"
@@ -107,14 +184,44 @@ def parse_google_news(ticker: str, max_items: int = NEWS_PER_SITE) -> List[str]:
         resp = fetch_url(url)
     except Exception:
         return []
-    soup = BeautifulSoup(resp.content, "xml")
+    try:
+        soup = BeautifulSoup(resp.content, "xml")
+    except Exception:
+        soup = BeautifulSoup(resp.content, "html.parser")
     items = soup.find_all("item")
-    headlines = []
+    results = []
     for item in items[:max_items]:
         title = item.title.get_text(strip=True) if item.title else ""
-        if title:
-            headlines.append(title)
-    return headlines
+        link = item.link.get_text(strip=True) if item.link else ""
+        ts = ""
+        if item.pubDate:
+            ts = item.pubDate.get_text(strip=True)
+        results.append({"title": title, "link": link, "source": "google", "timestamp": ts})
+    return results[:max_items]
+
+# -----------------------
+# High-level fetch per ticker (cached)
+# -----------------------
+@st.cache_data(show_spinner=False)
+def fetch_cached_all_sites_for_ticker(ticker: str, sites_tuple: Tuple[str, ...], max_items: int) -> List[Dict]:
+    sites = list(sites_tuple)
+    all_items = []
+    for s in sites:
+        if s == "finviz":
+            all_items.extend(parse_finviz(ticker, max_items))
+        elif s == "yahoo":
+            all_items.extend(parse_yahoo(ticker, max_items))
+        elif s == "google":
+            all_items.extend(parse_google_news(ticker, max_items))
+    # Deduplicate by title while preserving order
+    seen = set()
+    deduped = []
+    for item in all_items:
+        key = item.get("title", "")
+        if key and key not in seen:
+            deduped.append(item)
+            seen.add(key)
+    return deduped
 
 # -----------------------
 # Sentiment helpers
@@ -130,15 +237,13 @@ def analyze_vader(vader, text: str) -> str:
         return "neutral"
 
 def analyze_finbert(finbert_pipe, text: str) -> str:
-    # finbert pipeline returns label and score; label typically 'positive','negative','neutral'
     try:
-        out = finbert_pipe(text[:512])  # truncate to 512 tokens roughly to speed up
+        out = finbert_pipe(str(text)[:512])
     except Exception:
         return "neutral"
     if not out:
         return "neutral"
     label = out[0].get("label", "").lower()
-    # Some versions return 'POSITIVE' etc. Normalize:
     if "pos" in label:
         return "positive"
     if "neg" in label:
@@ -146,68 +251,51 @@ def analyze_finbert(finbert_pipe, text: str) -> str:
     return "neutral"
 
 # -----------------------
-# High-level processing
+# Process ticker: returns summary counts AND detailed headline-level rows
 # -----------------------
-def fetch_all_sites_for_ticker(ticker: str, sites: List[str]) -> List[str]:
-    """
-    Fetch headlines from selected sites for the ticker, up to NEWS_PER_SITE per site.
-    """
-    headlines = []
-    # We'll call each parser function; wrap each in try/except to be robust.
-    if "finviz" in sites:
-        headlines += parse_finviz(ticker, NEWS_PER_SITE)
-    if "yahoo" in sites:
-        headlines += parse_yahoo(ticker, NEWS_PER_SITE)
-    if "google" in sites:
-        headlines += parse_google_news(ticker, NEWS_PER_SITE)
-    # deduplicate while preserving order
-    seen = set()
-    deduped = []
-    for h in headlines:
-        if h not in seen:
-            deduped.append(h)
-            seen.add(h)
-    return deduped
-
-@st.cache_data(show_spinner=False)
-def fetch_cached_all_sites_for_ticker(ticker: str, sites_tuple: Tuple[str, ...]) -> List[str]:
-    # st.cache_data requires hashable args; pass sites as tuple
-    return fetch_all_sites_for_ticker(ticker, list(sites_tuple))
-
-def process_ticker(ticker: str, sites: List[str], run_vader: bool, run_finbert: bool) -> Dict:
-    """
-    Fetch headlines and run sentiment analyzers; return counts:
-    {
-      'ticker': ticker,
-      'vader_pos': int, 'vader_neg': int, 'vader_neu': int,
-      'finbert_pos': int, 'finbert_neg': int, 'finbert_neu': int
-    }
-    """
+def process_ticker(ticker: str, sites: List[str], run_vader: bool, run_finbert: bool, max_per_site: int) -> Dict:
     ticker = ticker.strip().upper()
-    headlines = fetch_cached_all_sites_for_ticker(ticker, tuple(sites))
+    headlines = fetch_cached_all_sites_for_ticker(ticker, tuple(sites), int(max_per_site))
     vader = load_vader() if run_vader else None
     finbert = load_finbert_pipeline() if run_finbert else None
 
     vpos = vneg = vneu = 0
     fpos = fneg = fneu = 0
+    detailed = []
 
     for h in headlines:
+        title = h.get("title", "")
+        link = h.get("link", "")
+        source = h.get("source", "")
+        timestamp = h.get("timestamp", "") or ""  # blank if not present
+
+        v_label = "n/a"
+        f_label = "n/a"
         if run_vader and vader:
-            res = analyze_vader(vader, h)
-            if res == "positive":
+            v_label = analyze_vader(vader, title)
+            if v_label == "positive":
                 vpos += 1
-            elif res == "negative":
+            elif v_label == "negative":
                 vneg += 1
             else:
                 vneu += 1
         if run_finbert and finbert:
-            res = analyze_finbert(finbert, h)
-            if res == "positive":
+            f_label = analyze_finbert(finbert, title)
+            if f_label == "positive":
                 fpos += 1
-            elif res == "negative":
+            elif f_label == "negative":
                 fneg += 1
             else:
                 fneu += 1
+
+        detailed.append({
+            "title": title,
+            "link": link,
+            "source": source,
+            "timestamp": timestamp,
+            "vader": v_label,
+            "finbert": f_label
+        })
 
     return {
         "ticker": ticker,
@@ -217,9 +305,9 @@ def process_ticker(ticker: str, sites: List[str], run_vader: bool, run_finbert: 
         "finbert_pos": fpos,
         "finbert_neg": fneg,
         "finbert_neu": fneu,
-        "n_headlines": len(headlines)
+        "n_headlines": len(headlines),
+        "headlines": detailed
     }
-
 
 # -----------------------
 # Streamlit UI
@@ -241,22 +329,18 @@ with st.sidebar:
         run_vader = st.checkbox("VADER (fast)", value=True)
     with col2:
         run_finbert = st.checkbox("FinBERT (slower)", value=True)
-    max_news = st.number_input("Max headlines per site", min_value=1, max_value=20, value=NEWS_PER_SITE)
+    max_news = st.number_input("Max headlines per site", min_value=1, max_value=20, value=3)
     st.write("Performance options")
     max_workers = st.slider("Concurrent workers (fetching)", 2, 20, 8)
     st.write("Tip: reduce FinBERT runs or max headlines to speed up on Streamlit Free tier.")
 
-# sync NEWS_PER_SITE with user
-NEWS_PER_SITE = int(max_news)
-
+# Input tickers
 tickers = []
 uploaded_file = None
-
 if input_mode == "Manual (text box)":
     raw = st.text_area("Enter tickers (comma, space or newline separated). Max {} tickers.".format(MAX_TICKERS),
                        placeholder="AAPL, MSFT, TSLA")
     if raw:
-        # split on comma/whitespace/lines
         candidates = [t.strip().upper() for t in raw.replace(",", " ").split()]
         tickers = [t for t in candidates if t]
 else:
@@ -268,18 +352,15 @@ else:
                 df = pd.read_csv(uploaded_file)
             else:
                 df = pd.read_excel(uploaded_file)
-            # try to extract tickers
             if "ticker" in (c.lower() for c in df.columns):
-                # find the column with name 'ticker' case-insensitive
                 col = next(c for c in df.columns if c.lower() == "ticker")
                 tickers = [str(x).strip().upper() for x in df[col].dropna().astype(str).tolist()]
             else:
-                # fallback: if single column, take that
                 if df.shape[1] == 1:
                     col = df.columns[0]
                     tickers = [str(x).strip().upper() for x in df[col].dropna().astype(str).tolist()]
                 else:
-                    st.warning("Uploaded file has multiple columns and no 'ticker' column. Please upload a single-column file or include a 'ticker' column.")
+                    st.warning("Uploaded file has multiple columns and no 'ticker' column. Please upload single-column file or include 'ticker' column.")
         except Exception as e:
             st.error(f"Failed to read uploaded file: {e}")
 
@@ -289,7 +370,6 @@ if len(tickers) > MAX_TICKERS:
 
 run_button = st.button("Run analysis")
 
-# show quick preview
 if tickers:
     st.markdown(f"**Tickers to analyze ({len(tickers)}):** {', '.join(tickers[:40])}")
 
@@ -303,14 +383,13 @@ if run_button:
     else:
         t0 = time.time()
         st.info("Fetching headlines and analyzing... (this may take some seconds — FinBERT is slower)")
-        # Use ThreadPoolExecutor to process tickers in parallel
         results = []
         progress_text = st.empty()
         progress_bar = st.progress(0)
         total = len(tickers)
         completed = 0
 
-        # Bind the model loads early (load into cache so not repeatedly downloaded during executor runs)
+        # Pre-load models
         if run_vader:
             _ = load_vader()
         if run_finbert:
@@ -318,22 +397,21 @@ if run_button:
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_ticker = {
-                executor.submit(process_ticker, t, sites_multiselect, run_vader, run_finbert): t for t in tickers
+                executor.submit(process_ticker, t, sites_multiselect, run_vader, run_finbert, int(max_news)): t for t in tickers
             }
             for fut in concurrent.futures.as_completed(future_to_ticker):
                 tkr = future_to_ticker[fut]
                 try:
                     res = fut.result()
                 except Exception as e:
+                    st.warning(f"Error processing {tkr}: {e}")
                     res = {
                         "ticker": tkr,
-                        "vader_pos": 0,
-                        "vader_neg": 0,
-                        "finbert_pos": 0,
-                        "finbert_neg": 0,
-                        "n_headlines": 0
+                        "vader_pos": 0, "vader_neg": 0, "vader_neu": 0,
+                        "finbert_pos": 0, "finbert_neg": 0, "finbert_neu": 0,
+                        "n_headlines": 0,
+                        "headlines": []
                     }
-                    st.warning(f"Error processing {tkr}: {e}")
                 results.append(res)
                 completed += 1
                 progress_bar.progress(completed / total)
@@ -341,7 +419,9 @@ if run_button:
         progress_bar.empty()
         progress_text.empty()
 
-        # Build DataFrame
+        # -----------------------
+        # Summary table with percentages
+        # -----------------------
         df_res = pd.DataFrame(results).set_index("ticker")
         df_res = df_res[
             ["vader_pos", "vader_neg", "vader_neu",
@@ -349,73 +429,134 @@ if run_button:
              "n_headlines"]
         ]
 
+        # add percentage columns (rounded to 1 decimal)
+        def pct(part, total):
+            try:
+                return round((part / total) * 100.0, 1) if total and total > 0 else 0.0
+            except Exception:
+                return 0.0
 
-        # Color the ticker labels based on counts: mostly positive => green, mostly negative => red
-        def color_row(ticker, row):
-            # Decide based on sum of positive vs negative from selected analyzers
-            pos = 0
-            neg = 0
-            if run_vader:
-                pos += row["vader_pos"]
-                neg += row["vader_neg"]
-            if run_finbert:
-                pos += row["finbert_pos"]
-                neg += row["finbert_neg"]
-            if pos > neg:
-                return f"color: green; font-weight: bold"
-            elif neg > pos:
-                return f"color: red; font-weight: bold"
-            else:
-                return f"color: black;"
+        extra_cols = []
+        for idx, row in df_res.reset_index().iterrows():
+            n = row["n_headlines"]
+            df_res.loc[row["ticker"], "vader_pos_%"] = pct(row["vader_pos"], n)
+            df_res.loc[row["ticker"], "vader_neg_%"] = pct(row["vader_neg"], n)
+            df_res.loc[row["ticker"], "finbert_pos_%"] = pct(row["finbert_pos"], n)
+            df_res.loc[row["ticker"], "finbert_neg_%"] = pct(row["finbert_neg"], n)
 
-        # For display, we'll show colored ticker names in a separate column
-        display_df = df_res.reset_index()
-        display_df["ticker_display"] = display_df["ticker"]  # placeholder
+        # Reorder columns for display
+        display_cols = [
+            "vader_pos", "vader_neg", "vader_neu",
+            "finbert_pos", "finbert_neg", "finbert_neu",
+            "n_headlines",
+            "vader_pos_%", "vader_neg_%", "finbert_pos_%", "finbert_neg_%"
+        ]
+        df_display = df_res[display_cols]
 
-        # Use st.table with markdown-like coloring via HTML in st.markdown per-row
         st.subheader("Sentiment counts summary")
-        # Build a simple HTML table so we can color the ticker name cell
-        def make_html_table(df):
-            header_cells = "".join(f"<th style='padding:8px;text-align:left'>{c}</th>" for c in df.columns if c != "ticker_display")
+        # Build HTML table so we color ticker name
+        def make_summary_html(df):
+            header_cells = "".join(f"<th style='padding:8px;text-align:left'>{html.escape(c)}</th>" for c in df.columns)
             header = f"<tr><th style='padding:8px;text-align:left'>Ticker</th>{header_cells}</tr>"
             rows = []
-            for _, r in df.iterrows():
-                # compute color
-                pos = 0
-                neg = 0
+            for idx, r in df.reset_index().iterrows():
+                pos = 0; neg = 0
                 if run_vader:
-                    pos += r["vader_pos"]
-                    neg += r["vader_neg"]
+                    pos += r["vader_pos"]; neg += r["vader_neg"]
                 if run_finbert:
-                    pos += r["finbert_pos"]
-                    neg += r["finbert_neg"]
+                    pos += r["finbert_pos"]; neg += r["finbert_neg"]
                 if pos > neg:
                     color = "green"
                 elif neg > pos:
                     color = "red"
                 else:
                     color = "black"
-                ticker_html = f"<span style='color:{color};font-weight:bold'>{r['ticker']}</span>"
-                other_cells = "".join(f"<td style='padding:6px'>{r[c]}</td>" for c in df.columns if c != "ticker_display")
+                ticker_html = f"<span style='color:{color};font-weight:bold'>{html.escape(r['ticker'])}</span>"
+                other_cells = "".join(f"<td style='padding:6px'>{html.escape(str(r[c]))}</td>" for c in df.columns)
                 rows.append(f"<tr><td style='padding:6px'>{ticker_html}</td>{other_cells}</tr>")
             table = f"<table style='border-collapse: collapse;'>{header}{''.join(rows)}</table>"
             return table
 
-        # Reformat display columns order
-        display_df = display_df[
-            ["ticker", "vader_pos", "vader_neg", "vader_neu",
-             "finbert_pos", "finbert_neg", "finbert_neu", "n_headlines"]
-        ]
+        st.markdown(make_summary_html(df_display), unsafe_allow_html=True)
 
-        html_table = make_html_table(display_df)
-        st.markdown(html_table, unsafe_allow_html=True)
+        # -----------------------
+        # Detailed headlines table (with timestamp and colored sentiments)
+        # -----------------------
+        st.subheader("All headlines (detailed) — color-coded sentiments")
+        def sentiment_color_label(label: str) -> str:
+            if label == "positive":
+                return "<span style='color:green;font-weight:bold'>positive</span>"
+            elif label == "negative":
+                return "<span style='color:red;font-weight:bold'>negative</span>"
+            elif label == "neutral":
+                return "<span style='color:orange;font-weight:bold'>neutral</span>"
+            else:
+                return "<span style='color:gray'>n/a</span>"
 
-        # Also provide a normal dataframe (downloadable)
-        st.subheader("Raw results (downloadable CSV)")
-        st.dataframe(df_res)
+        detail_rows = []
+        for r in results:
+            tkr = r["ticker"]
+            for h in r.get("headlines", []):
+                title = h.get("title", "")
+                link = h.get("link", "")
+                source = h.get("source", "")
+                timestamp = h.get("timestamp", "") or ""
+                vader_label = h.get("vader", "n/a")
+                fin_label = h.get("finbert", "n/a")
+                detail_rows.append({
+                    "ticker": tkr,
+                    "source": source,
+                    "title": title,
+                    "link": link,
+                    "timestamp": timestamp,
+                    "vader": vader_label,
+                    "finbert": fin_label
+                })
 
-        csv = df_res.reset_index().to_csv(index=False).encode("utf-8")
-        st.download_button(label="Download results as CSV", data=csv, file_name="sentiment_results.csv", mime="text/csv")
+        # Sort detailed rows by timestamp when possible (items without timestamp go last)
+        def ts_sort_key(row):
+            ts = row.get("timestamp", "")
+            # try simple patterns: RFC-822/pubDate or relative times — we cannot reliably parse all formats,
+            # so prefer rows with non-empty ts (they'll appear first). Preserve original order otherwise.
+            return (0 if ts else 1, ts)
+        detail_rows_sorted = sorted(detail_rows, key=ts_sort_key)
+
+        # Build HTML table for details
+        def make_detail_html(rows):
+            header = "<tr>" \
+                     "<th style='padding:8px;text-align:left'>Ticker</th>" \
+                     "<th style='padding:8px;text-align:left'>Timestamp</th>" \
+                     "<th style='padding:8px;text-align:left'>Source</th>" \
+                     "<th style='padding:8px;text-align:left'>Headline</th>" \
+                     "<th style='padding:8px;text-align:left'>VADER</th>" \
+                     "<th style='padding:8px;text-align:left'>FinBERT</th>" \
+                     "</tr>"
+            row_html = []
+            for r in rows:
+                ticker = html.escape(r["ticker"])
+                ts = html.escape(r.get("timestamp", ""))
+                source = html.escape(r.get("source", ""))
+                title = html.escape(r.get("title", ""))
+                link = r.get("link") or ""
+                if link:
+                    safe_link = html.escape(link, quote=True)
+                    headline_cell = f"<a href='{safe_link}' target='_blank' rel='noopener noreferrer'>{title}</a>"
+                else:
+                    headline_cell = title
+                vader_col = sentiment_color_label(r.get("vader", "n/a"))
+                fin_col = sentiment_color_label(r.get("finbert", "n/a"))
+                row_html.append(f"<tr>"
+                                f"<td style='padding:6px'>{ticker}</td>"
+                                f"<td style='padding:6px'>{ts}</td>"
+                                f"<td style='padding:6px'>{source}</td>"
+                                f"<td style='padding:6px'>{headline_cell}</td>"
+                                f"<td style='padding:6px'>{vader_col}</td>"
+                                f"<td style='padding:6px'>{fin_col}</td>"
+                                f"</tr>")
+            table = f"<table style='border-collapse: collapse; width:100%'>{header}{''.join(row_html)}</table>"
+            return table
+
+        st.markdown(make_detail_html(detail_rows_sorted), unsafe_allow_html=True)
 
         t_elapsed = time.time() - t0
-        st.success(f"Done — processed {len(results)} tickers in {t_elapsed:.1f} s. Headlines per ticker (deduped): see 'n_headlines' column.")
+        st.success(f"Done — processed {len(results)} tickers in {t_elapsed:.1f} s. Headlines per ticker (deduped): see 'n_headlines' column in summary.")
