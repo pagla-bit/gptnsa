@@ -1,10 +1,8 @@
-streamlit>=1.20
-requests
-beautifulsoup4
+streamlit
 pandas
+aiohttp
+beautifulsoup4
 vaderSentiment
-transformers>=4.0
 torch
-sentencepiece
-openpyxl
-lxml
+transformers
+python-dateutil
