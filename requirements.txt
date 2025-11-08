@@ -4,6 +4,7 @@ beautifulsoup4
 pandas
 vaderSentiment
 transformers>=4.0
-torch  # or 'torch>=1.13' depending on environment; streamlit cloud supports CPU torch
-sentencepiece  # sometimes needed for tokenizers
-openpyxl  # for reading xlsx
+torch
+sentencepiece
+openpyxl
+lxml
