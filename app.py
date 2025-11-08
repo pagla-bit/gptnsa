@@ -416,14 +416,22 @@ if run_button:
         grouped_sorted_rows = []
         for ticker in sorted(grouped.keys()):
             items = grouped[ticker]
-            # attach parsed dt
+            # attach parsed dt safely
             for it in items:
-                it["_dt"] = parse_ts(it["timestamp_raw"])
-            # sort: items with dt first sorted desc by dt, then items without dt preserving original order
-            with_dt = [x for x in items if x["_dt"] is not None]
-            without_dt = [x for x in items if x["_dt"] is None]
-            with_dt_sorted = sorted(with_dt, key=lambda x: x["_dt"], reverse=True)
+                it["_dt"] = parse_ts(it.get("timestamp_raw", ""))
+
+            # split into parsed and unparsed
+            with_dt = [x for x in items if isinstance(x.get("_dt"), (pd.Timestamp, type(date_parser.parse('2020-01-01'))))]
+            without_dt = [x for x in items if not isinstance(x.get("_dt"), (pd.Timestamp, type(date_parser.parse('2020-01-01'))))]
+
+            # safely sort with_dt
+            try:
+                with_dt_sorted = sorted(with_dt, key=lambda x: x["_dt"], reverse=True)
+            except Exception:
+                with_dt_sorted = with_dt  # fallback to original order if anything weird happens
+
             grouped_sorted_rows.extend(with_dt_sorted + without_dt)
+
 
         # Build HTML table for details; use emoji balls (no text)
         def ball_for(label):
