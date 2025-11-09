@@ -450,4 +450,57 @@ if run_button:
 
         # Parse timestamps
         def parse_ts(ts_str):
-            if not ts_str
+            if not ts_str:
+                return None
+            try:
+                return date_parser.parse(ts_str, fuzzy=True)
+            except Exception:
+                return None
+
+        for r in filtered_rows:
+            r["_dt"] = parse_ts(r["timestamp_raw"])
+        filtered_rows.sort(key=lambda x: (x["_dt"] is not None, x["_dt"]), reverse=True)
+
+        # Build table
+        def ball_for(label):
+            if label == "positive": return "🟢"
+            if label == "negative": return "🔴"
+            if label == "neutral": return "🟡"
+            return ""
+
+        detail_header = ("<tr>"
+                         "<th>Ticker</th>"
+                         "<th>Timestamp</th>"
+                         "<th>Source</th>"
+                         "<th>Headline</th>"
+                         "<th>VADER</th>"
+                         "<th>FINBERT</th>"
+                         "</tr>")
+        detail_rows_html = []
+        for it in filtered_rows:
+            ticker = html.escape(it["ticker"])
+            ts_formatted = it["_dt"].strftime("%Y-%m-%d %H:%M") if it["_dt"] else html.escape(it["timestamp_raw"])
+            link = it.get("link") or ""
+            try:
+                source_host = urllib.parse.urlparse(link).netloc.replace("www.", "") if link else ""
+            except Exception:
+                source_host = ""
+            source_host = html.escape(source_host)
+            title_escaped = html.escape(it.get("title", ""))
+            headline_cell = f"<a href='{html.escape(link, quote=True)}' target='_blank'>{title_escaped}</a>" if link else title_escaped
+            vader_ball = ball_for(it.get("vader", ""))
+            finbert_ball = ball_for(it.get("finbert", ""))
+            detail_rows_html.append(
+                f"<tr><td>{ticker}</td><td>{ts_formatted}</td><td>{source_host}</td>"
+                f"<td>{headline_cell}</td><td style='text-align:center'>{vader_ball}</td>"
+                f"<td style='text-align:center'>{finbert_ball}</td></tr>"
+            )
+
+        detail_table = f"<table style='border-collapse: collapse; width:100%'>{detail_header}{''.join(detail_rows_html)}</table>"
+        st.markdown(detail_table, unsafe_allow_html=True)
+
+        # -----------------------
+        # Done
+        # -----------------------
+        t_elapsed = time.time() - t0
+        st.success(f"Done — processed {len(results)} tickers in {t_elapsed:.1f} s.")
