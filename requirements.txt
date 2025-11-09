@@ -1,9 +1,10 @@
-streamlit
-pandas
+sstreamlit
 requests
 beautifulsoup4
-aiohttp
+lxml
+pandas
 vaderSentiment
-torch
 transformers
+torch
+python-dateutil
 openpyxl
