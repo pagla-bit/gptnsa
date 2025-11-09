@@ -183,233 +183,207 @@ def parse_google_news(ticker: str, max_items: int = 10) -> List[Dict]:
             except Exception:
                 ts = ""
         results.append({"title": title, "link": link, "source": "google", "timestamp": ts})
-    return results[:max_items]
+    return results
 
 # -----------------------
-# High-level fetch per ticker (cached)
+# Sentiment analysis functions
 # -----------------------
-@st.cache_data(show_spinner=False)
-def fetch_cached_all_sites_for_ticker(ticker: str, sites_tuple: Tuple[str, ...], max_items: int) -> List[Dict]:
-    sites = list(sites_tuple)
-    all_items = []
-    for s in sites:
-        if s == "finviz":
-            all_items.extend(parse_finviz(ticker, max_items))
-        elif s == "google":
-            all_items.extend(parse_google_news(ticker, max_items))
-    # dedupe by title preserving order
-    seen = set()
-    deduped = []
-    for it in all_items:
-        key = it.get("title", "")
-        if key and key not in seen:
-            deduped.append(it)
-            seen.add(key)
-    return deduped
-
-# -----------------------
-# Sentiment helpers
-# -----------------------
-def analyze_vader(vader, text: str) -> str:
-    vs = vader.polarity_scores(text)
-    c = vs["compound"]
-    if c >= 0.05:
+def analyze_vader(text: str, vader) -> str:
+    if not text:
+        return "neutral"
+    scores = vader.polarity_scores(text)
+    comp = scores["compound"]
+    if comp >= 0.05:
         return "positive"
-    elif c <= -0.05:
+    elif comp <= -0.05:
         return "negative"
     else:
         return "neutral"
 
-def analyze_finbert(finbert_pipe, text: str) -> str:
-    try:
-        out = finbert_pipe(text[:512])
-    except Exception:
-        return "neutral"
-    if not out:
-        return "neutral"
-    label = out[0].get("label", "").lower()
-    if "pos" in label:
-        return "positive"
-    if "neg" in label:
-        return "negative"
-    return "neutral"
+def analyze_finbert_batch(texts: List[str], finbert) -> List[str]:
+    """
+    Batch predict with FinBERT. Returns a list of labels: "positive", "negative", "neutral".
+    """
+    if not texts:
+        return []
+    results = finbert(texts, top_k=1)
+    return [r[0]["label"].lower() for r in results]
 
 # -----------------------
-# Process ticker: returns summary counts and detailed headlines
+# Main processing function (per ticker)
 # -----------------------
-def process_ticker(ticker: str, sites: List[str], run_vader: bool, run_finbert: bool, max_per_site: int) -> Dict:
-    ticker = ticker.strip().upper()
-    headlines = fetch_cached_all_sites_for_ticker(ticker, tuple(sites), int(max_per_site))
-    vader = load_vader() if run_vader else None
-    finbert_pipe = load_finbert_pipeline() if run_finbert else None
+def process_ticker(ticker: str, vader, finbert, news_per_ticker: int = 10) -> Dict:
+    """
+    For one ticker: fetch from Finviz + Google, analyze sentiment, return summary:
+    {
+      "ticker": str,
+      "vader_pos": int,
+      "vader_neg": int,
+      "vader_neu": int,
+      "finbert_pos": int,
+      "finbert_neg": int,
+      "finbert_neu": int,
+      "headlines": list of {title,link,timestamp,vader,finbert}
+    }
+    """
+    finviz_news = parse_finviz(ticker, max_items=news_per_ticker)
+    google_news = parse_google_news(ticker, max_items=news_per_ticker)
+    all_news = finviz_news + google_news
 
-    vpos = vneg = vneu = 0
-    fpos = fneg = fneu = 0
-    detailed = []
+    if not all_news:
+        return {
+            "ticker": ticker,
+            "vader_pos": 0,
+            "vader_neg": 0,
+            "vader_neu": 0,
+            "finbert_pos": 0,
+            "finbert_neg": 0,
+            "finbert_neu": 0,
+            "headlines": []
+        }
 
-    for h in headlines:
-        title = h.get("title", "")
-        link = h.get("link", "")
-        source = h.get("source", "")
-        timestamp = h.get("timestamp", "") or ""
+    # dedupe by title (case-insensitive)
+    seen = set()
+    unique_news = []
+    for n in all_news:
+        t = n["title"].strip().lower()
+        if t and t not in seen:
+            seen.add(t)
+            unique_news.append(n)
 
-        v_label = "n/a"
-        f_label = "n/a"
-        if run_vader and vader:
-            v_label = analyze_vader(vader, title)
-            if v_label == "positive":
-                vpos += 1
-            elif v_label == "negative":
-                vneg += 1
-            else:
-                vneu += 1
-        if run_finbert and finbert_pipe:
-            f_label = analyze_finbert(finbert_pipe, title)
-            if f_label == "positive":
-                fpos += 1
-            elif f_label == "negative":
-                fneg += 1
-            else:
-                fneu += 1
+    # split text
+    titles = [n["title"] for n in unique_news]
 
-        detailed.append({
-            "title": title,
-            "link": link,
-            "source": source,
-            "timestamp": timestamp,
-            "vader": v_label,
-            "finbert": f_label
+    # VADER
+    vader_labels = [analyze_vader(t, vader) for t in titles]
+
+    # FinBERT (batch)
+    finbert_labels = analyze_finbert_batch(titles, finbert)
+
+    # counts
+    vader_pos = vader_labels.count("positive")
+    vader_neg = vader_labels.count("negative")
+    vader_neu = vader_labels.count("neutral")
+    finbert_pos = finbert_labels.count("positive")
+    finbert_neg = finbert_labels.count("negative")
+    finbert_neu = finbert_labels.count("neutral")
+
+    # build headlines array
+    headlines = []
+    for n, vl, fl in zip(unique_news, vader_labels, finbert_labels):
+        headlines.append({
+            "title": n["title"],
+            "link": n["link"],
+            "timestamp": n["timestamp"],
+            "vader": vl,
+            "finbert": fl
         })
 
     return {
         "ticker": ticker,
-        "vader_pos": vpos,
-        "vader_neg": vneg,
-        "vader_neu": vneu,
-        "finbert_pos": fpos,
-        "finbert_neg": fneg,
-        "finbert_neu": fneu,
-        "n_headlines": len(headlines),
-        "headlines": detailed
+        "vader_pos": vader_pos,
+        "vader_neg": vader_neg,
+        "vader_neu": vader_neu,
+        "finbert_pos": finbert_pos,
+        "finbert_neg": finbert_neg,
+        "finbert_neu": finbert_neu,
+        "headlines": headlines
     }
 
 # -----------------------
-# UI (sidebar & main)
+# Streamlit UI
 # -----------------------
-st.title("Stock Ticker News Sentiment (VADER + FinBERT)")
+def main():
+    st.title("📊 Multi-Ticker News Sentiment Analyzer")
+    st.markdown("Fetch and analyze news sentiment for multiple tickers (Finviz + Google News) using VADER & FinBERT.")
 
-with st.sidebar:
-    st.header("Controls")
-    input_mode = st.radio("Input method", ("Manual (text)", "Upload Excel (single-column)", "Finviz Screener URL"))
-    run_vader = st.checkbox("VADER (fast)", value=True)
-    run_finbert = st.checkbox("FinBERT (slower)", value=True)
-    sites_multiselect = st.multiselect("News sources", ["finviz", "google"], default=["finviz", "google"])
-    max_news = st.number_input("Max headlines per site", min_value=1, max_value=20, value=3)
-    max_workers = st.slider("Concurrent workers", 2, 20, 8)
-    st.write("---")
-    st.write("Input tickers / screener")
-    tickers = []
-    screener_url = ""
-    uploaded_file = None
-    if input_mode == "Manual (text)":
-        raw = st.text_area("Tickers (comma, newline or space separated)", placeholder="AAPL, MSFT, TSLA")
-        if raw:
-            candidates = [t.strip().upper() for t in raw.replace(",", " ").split()]
-            tickers = [t for t in candidates if t]
-    elif input_mode == "Upload Excel (single-column)":
-        uploaded_file = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
-        if uploaded_file is not None:
-            try:
-                df = pd.read_excel(uploaded_file)
-                # prefer 'ticker' column if present
-                if "ticker" in (c.lower() for c in df.columns):
-                    col = next(c for c in df.columns if c.lower() == "ticker")
-                    tickers = [str(x).strip().upper() for x in df[col].dropna().astype(str).tolist()]
+    # Sidebar
+    with st.sidebar:
+        st.header("Configuration")
+        
+        st.markdown("### Input Method")
+        input_choice = st.radio(
+            "Choose input method:",
+            options=["Enter Tickers Manually", "Use Finviz Screener URL"],
+            index=0
+        )
+        
+        tickers_to_process = []
+        
+        if input_choice == "Enter Tickers Manually":
+            tickers_input = st.text_area(
+                "Enter tickers (comma-separated or one per line)",
+                value="AAPL,GOOGL,MSFT,TSLA,NVDA",
+                height=100
+            )
+            if tickers_input.strip():
+                raw = tickers_input.replace(",", " ").replace("\n", " ").strip()
+                tickers_to_process = [t.strip().upper() for t in raw.split() if t.strip()]
+        else:
+            screener_url = st.text_input(
+                "Finviz Screener URL",
+                value="",
+                placeholder="https://finviz.com/screener.ashx?v=111&f=..."
+            )
+            if screener_url.strip():
+                with st.spinner("Extracting tickers from screener..."):
+                    tickers_to_process = extract_tickers_from_finviz_screener(screener_url, max_total=MAX_TICKERS)
+                if tickers_to_process:
+                    st.success(f"Extracted {len(tickers_to_process)} tickers from screener")
+                    with st.expander("Show extracted tickers"):
+                        st.write(", ".join(tickers_to_process))
                 else:
-                    if df.shape[1] == 1:
-                        col = df.columns[0]
-                        tickers = [str(x).strip().upper() for x in df[col].dropna().astype(str).tolist()]
-                    else:
-                        st.warning("Uploaded file has multiple columns and no 'ticker' column. Please upload a single-column file or include 'ticker' column named 'ticker'.")
-            except Exception as e:
-                st.error(f"Failed to read uploaded file: {e}")
-    else:
-        screener_url = st.text_input("Paste Finviz screener URL (will fetch all pages):", placeholder="https://finviz.com/screener.ashx?v=111&f=...")
-        if screener_url:
-            with st.spinner("Fetching tickers from screener (may take a few seconds)..."):
-                try:
-                    tickers = extract_tickers_from_finviz_screener(screener_url, max_total=MAX_TICKERS)
-                    if not tickers:
-                        st.warning("No tickers found on the provided screener URL.")
-                except Exception as e:
-                    st.error(f"Failed to extract tickers from screener URL: {e}")
-    if len(tickers) > MAX_TICKERS:
-        st.warning(f"Too many tickers provided; limiting to first {MAX_TICKERS}.")
-        tickers = tickers[:MAX_TICKERS]
+                    st.error("No tickers found. Check the URL.")
 
-    run_button = st.button("Run analysis")
+        st.markdown("---")
+        news_per_ticker = st.slider(
+            "Max news items per ticker (per source)",
+            min_value=5,
+            max_value=30,
+            value=10,
+            step=5
+        )
+        
+        max_workers = st.slider(
+            "Concurrent workers",
+            min_value=1,
+            max_value=10,
+            value=5,
+            step=1,
+            help="Number of parallel threads for fetching news"
+        )
 
-# preview tickers in main
-if tickers:
-    st.markdown(f"**Tickers to analyze ({len(tickers)}):** {', '.join(tickers[:40])}")
+    # Main area
+    if st.button("🚀 Analyze Sentiment", type="primary", use_container_width=True):
+        if not tickers_to_process:
+            st.warning("Please enter tickers or provide a screener URL.")
+            return
 
-# When button pressed
-if run_button:
-    if not tickers:
-        st.error("No tickers provided.")
-    elif not sites_multiselect:
-        st.error("Select at least one news source.")
-    elif not (run_vader or run_finbert):
-        st.error("Select at least one sentiment analyzer.")
-    else:
+        st.info(f"Processing {len(tickers_to_process)} tickers with {max_workers} workers...")
         t0 = time.time()
-        st.info("Fetching headlines and analyzing... (FinBERT may be slower)")
 
-        # Pre-load models so caching works for threads
-        if run_vader:
-            _ = load_vader()
-        if run_finbert:
-            _ = load_finbert_pipeline()
+        # load models
+        vader = load_vader()
+        finbert = load_finbert_pipeline()
 
+        # parallel fetch
         results = []
-        progress_text = st.empty()
-        progress_bar = st.progress(0)
-        total = len(tickers)
-        completed = 0
-
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_ticker = {
-                executor.submit(process_ticker, t, sites_multiselect, run_vader, run_finbert, int(max_news)): t for t in tickers
-            }
-            for fut in concurrent.futures.as_completed(future_to_ticker):
-                tkr = future_to_ticker[fut]
+            future_map = {executor.submit(process_ticker, tkr, vader, finbert, news_per_ticker): tkr for tkr in tickers_to_process}
+            for future in concurrent.futures.as_completed(future_map):
                 try:
-                    res = fut.result()
+                    res = future.result()
+                    results.append(res)
                 except Exception as e:
+                    tkr = future_map[future]
                     st.warning(f"Error processing {tkr}: {e}")
-                    res = {
-                        "ticker": tkr,
-                        "vader_pos": 0, "vader_neg": 0, "vader_neu": 0,
-                        "finbert_pos": 0, "finbert_neg": 0, "finbert_neu": 0,
-                        "n_headlines": 0,
-                        "headlines": []
-                    }
-                results.append(res)
-                completed += 1
-                progress_bar.progress(completed / total)
-                progress_text.text(f"Processed {completed}/{total} tickers")
-        progress_bar.empty()
-        progress_text.empty()
 
-        # -----------------------
-        # Build summary table (no percentages)
-        # Column groups: VADER and FINBERT (each cell shows three emoji-balls with counts)
-        # -----------------------
-        df_res = pd.DataFrame(results).set_index("ticker")
-        display_df = df_res[[
-            "vader_pos", "vader_neg", "vader_neu",
-            "finbert_pos", "finbert_neg", "finbert_neu",
-        ]]
+        if not results:
+            st.error("No results to display.")
+            return
+
+        # Create display dataframe for summary
+        display_df = pd.DataFrame(results).set_index("ticker")
 
         st.subheader("Sentiment counts summary")
         def ticker_color_style(ticker, row):
@@ -486,7 +460,7 @@ if run_button:
             st.markdown(table_html, unsafe_allow_html=True)
 
         # -----------------------
-        # Detailed headlines table: grouped by ticker and sorted newest -> oldest
+        # Detailed headlines table with TICKER FILTER DROPDOWN
         # -----------------------
         st.subheader("All headlines (detailed) — grouped by ticker, newest first")
 
@@ -504,6 +478,23 @@ if run_button:
                     "finbert": h.get("finbert", "n/a")
                 })
 
+        # Create ticker filter dropdown
+        all_tickers = sorted(list(set([r["ticker"] for r in detail_rows])))
+        ticker_options = ["All Tickers"] + all_tickers
+        
+        selected_ticker = st.selectbox(
+            "Filter by ticker:",
+            options=ticker_options,
+            index=0,
+            key="ticker_filter"
+        )
+
+        # Filter rows based on selection
+        if selected_ticker != "All Tickers":
+            filtered_rows = [r for r in detail_rows if r["ticker"] == selected_ticker]
+        else:
+            filtered_rows = detail_rows
+
         # Parse and normalize timestamp into datetime if possible
         def parse_ts(ts_str):
             if not ts_str:
@@ -516,7 +507,7 @@ if run_button:
 
         # Group by ticker alphabetically, and within each ticker sort by timestamp descending (with parsed times first)
         grouped = {}
-        for r in detail_rows:
+        for r in filtered_rows:
             grouped.setdefault(r["ticker"], []).append(r)
 
         grouped_sorted_rows = []
@@ -533,6 +524,9 @@ if run_button:
             except Exception:
                 with_dt_sorted = with_dt
             grouped_sorted_rows.extend(with_dt_sorted + without_dt)
+
+        # Display count
+        st.caption(f"Showing {len(grouped_sorted_rows)} headlines{' for ' + selected_ticker if selected_ticker != 'All Tickers' else ''}")
 
         # Build HTML table for details; use emoji balls (no text)
         def ball_for(label):
@@ -594,3 +588,5 @@ if run_button:
         t_elapsed = time.time() - t0
         st.success(f"Done — processed {len(results)} tickers in {t_elapsed:.1f} s.")
 
+if __name__ == "__main__":
+    main()
