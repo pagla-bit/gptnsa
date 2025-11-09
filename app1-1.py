@@ -294,7 +294,12 @@ st.title("Stock Ticker News Sentiment (VADER + FinBERT)")
 
 with st.sidebar:
     st.header("Controls")
-    input_mode = st.radio("Input method", ("Manual (text)", "Upload Excel (single-column)", "Finviz Screener URL"))
+    input_mode = st.radio(
+        "Input method",
+        ("Manual (text)", "Upload Excel (single-column)", "Finviz Screener URL"),
+        key="input_mode_radio"
+    )
+
     st.write("Sentiment analyzers")
     col1, col2 = st.columns(2)
     with col1:
