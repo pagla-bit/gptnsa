@@ -587,6 +587,96 @@ if run_button:
                 f"<td style='padding:6px;text-align:center'>{finbert_ball}</td>"
                 f"</tr>"
             )
+# -----------------------
+# Detailed headlines table with filter options
+# -----------------------
+st.subheader("All headlines (detailed) — grouped by ticker, newest first")
+
+# Collect all detail rows
+detail_rows = []
+for r in results:
+    tkr = r["ticker"]
+    for h in r.get("headlines", []):
+        detail_rows.append({
+            "ticker": tkr,
+            "timestamp_raw": h.get("timestamp", "") or "",
+            "title": h.get("title", ""),
+            "link": h.get("link", ""),
+            "vader": h.get("vader", "n/a"),
+            "finbert": h.get("finbert", "n/a")
+        })
+
+# Add dropdown and search
+unique_tickers = sorted(set([r["ticker"] for r in results]))
+col1, col2 = st.columns([1, 1])
+with col1:
+    selected_ticker = st.selectbox("Filter by ticker", ["All"] + unique_tickers, index=0)
+with col2:
+    search_term = st.text_input("Search headlines or tickers", "")
+
+# Filter rows
+filtered_rows = []
+for r in detail_rows:
+    if selected_ticker != "All" and r["ticker"] != selected_ticker:
+        continue
+    if search_term and search_term.lower() not in (r["title"].lower() + " " + r["ticker"].lower()):
+        continue
+    filtered_rows.append(r)
+
+# Parse and normalize timestamp into datetime if possible
+def parse_ts(ts_str):
+    if not ts_str:
+        return None
+    try:
+        return date_parser.parse(ts_str, fuzzy=True)
+    except Exception:
+        return None
+
+# Group + sort
+for r in filtered_rows:
+    r["_dt"] = parse_ts(r["timestamp_raw"])
+filtered_rows.sort(key=lambda x: (x["_dt"] is not None, x["_dt"]), reverse=True)
+
+# Build HTML table
+def ball_for(label):
+    if label == "positive": return "🟢"
+    if label == "negative": return "🔴"
+    if label == "neutral": return "🟡"
+    return ""
+
+detail_header = ("<tr>"
+                 "<th style='padding:8px;text-align:left'>Ticker</th>"
+                 "<th style='padding:8px;text-align:left'>Timestamp</th>"
+                 "<th style='padding:8px;text-align:left'>Source</th>"
+                 "<th style='padding:8px;text-align:left'>Headline</th>"
+                 "<th style='padding:8px;text-align:center'>VADER</th>"
+                 "<th style='padding:8px;text-align:center'>FINBERT</th>"
+                 "</tr>")
+detail_rows_html = []
+for it in filtered_rows:
+    ticker = html.escape(it["ticker"])
+    ts_formatted = it["_dt"].strftime("%Y-%m-%d %H:%M") if it["_dt"] else html.escape(it["timestamp_raw"])
+    link = it.get("link") or ""
+    try:
+        source_host = urllib.parse.urlparse(link).netloc.replace("www.", "") if link else ""
+    except Exception:
+        source_host = ""
+    source_host = html.escape(source_host)
+    title_escaped = html.escape(it.get("title", ""))
+    headline_cell = f"<a href='{html.escape(link, quote=True)}' target='_blank'>{title_escaped}</a>" if link else title_escaped
+    vader_ball = ball_for(it.get("vader", ""))
+    finbert_ball = ball_for(it.get("finbert", ""))
+    detail_rows_html.append(
+        f"<tr><td style='padding:6px'>{ticker}</td>"
+        f"<td style='padding:6px'>{ts_formatted}</td>"
+        f"<td style='padding:6px'>{source_host}</td>"
+        f"<td style='padding:6px'>{headline_cell}</td>"
+        f"<td style='padding:6px;text-align:center'>{vader_ball}</td>"
+        f"<td style='padding:6px;text-align:center'>{finbert_ball}</td></tr>"
+    )
+
+detail_table = f"<table style='border-collapse: collapse; width:100%'>{detail_header}{''.join(detail_rows_html)}</table>"
+st.markdown(detail_table, unsafe_allow_html=True)
 
         detail_table = f"<table style='border-collapse: collapse; width:100%'>{detail_header}{''.join(detail_rows_html)}</table>"
         st.markdown(detail_table, unsafe_allow_html=True)
