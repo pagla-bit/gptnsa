@@ -459,7 +459,7 @@ if run_button:
 
         for r in filtered_rows:
             r["_dt"] = parse_ts(r["timestamp_raw"])
-        filtered_rows.sort(key=lambda x: (x["_dt"] is not None, x["_dt"]), reverse=True)
+        filtered_rows.sort(key=lambda x: (x["_dt"] is not None, x["_dt"] or pd.Timestamp.min), reverse=True)
 
         # Build table
         def ball_for(label):
