@@ -1,10 +1,10 @@
-sstreamlit
-requests
+streamlit
+aiohttp
 beautifulsoup4
-lxml
 pandas
-vaderSentiment
+requests
 transformers
 torch
-python-dateutil
-openpyxl
+vaderSentiment
+lxml
+html5lib
