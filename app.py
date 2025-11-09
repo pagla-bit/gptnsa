@@ -17,7 +17,7 @@ from dateutil import parser as date_parser
 # -----------------------
 st.set_page_config(page_title="Ticker News Sentiment", layout="wide")
 REQUEST_TIMEOUT = 10
-MAX_TICKERS = 40
+MAX_TICKERS = 200  # safety cap for screener extraction
 
 # -----------------------
 # Cached model loaders
@@ -41,11 +41,69 @@ def fetch_url(url: str, headers=None, params=None) -> requests.Response:
     return resp
 
 # -----------------------
-# Parsers (return list of dicts: title, link, source, timestamp)
+# Finviz screener parser (follows pagination to collect tickers)
+# -----------------------
+def extract_tickers_from_finviz_screener(screener_url: str, max_total: int = 500) -> List[str]:
+    """
+    Given a Finviz screener URL (e.g. https://finviz.com/screener.ashx?v=111&f=...),
+    follow pagination and extract all tickers. Pagination uses 'r=' parameter (1,21,41,...).
+    Stops when no new tickers found or max_total reached.
+    """
+    if not screener_url:
+        return []
+    parsed = urllib.parse.urlparse(screener_url)
+    base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    query = urllib.parse.parse_qs(parsed.query)
+    # Keep existing query params except 'r'
+    base_params = {k: v[0] for k, v in query.items() if k != "r"}
+    tickers = []
+    seen = set()
+    start = 1
+    page_size = 20  # Finviz shows 20 tickers per page typically
+    while True:
+        params = dict(base_params)
+        params["r"] = str(start)
+        try:
+            resp = fetch_url(base, params=params)
+        except Exception:
+            break
+        soup = BeautifulSoup(resp.text, "html.parser")
+        # Find ticker links - usually anchors with href like 'quote.ashx?t=AAPL'
+        anchors = soup.find_all("a", href=True)
+        page_tickers = []
+        for a in anchors:
+            href = a["href"]
+            if "quote.ashx?t=" in href:
+                # extract ticker param
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
+                t = q.get("t")
+                if t:
+                    ticker = t[0].strip().upper()
+                    if ticker and ticker not in seen:
+                        page_tickers.append(ticker)
+                        seen.add(ticker)
+                        tickers.append(ticker)
+                        if len(tickers) >= max_total:
+                            break
+        # If no tickers found on this page, stop
+        if not page_tickers:
+            break
+        # If we reached fewer than page_size found, might be last page - but continue to check next page until no new found
+        if len(tickers) >= max_total:
+            break
+        start += page_size
+        # safety break
+        if start > 2000:
+            break
+        # small loop continue to next page
+    return tickers
+
+# -----------------------
+# Parsers (Finviz and Google news)
 # -----------------------
 def parse_finviz(ticker: str, max_items: int = 10) -> List[Dict]:
     """
-    Parse Finviz news table. Use headers to avoid being blocked.
+    Parse Finviz news table. Returns list of {"title","link","source":"finviz","timestamp": "..."}.
     """
     url = "https://finviz.com/quote.ashx"
     params = {"t": ticker}
@@ -54,23 +112,20 @@ def parse_finviz(ticker: str, max_items: int = 10) -> List[Dict]:
     except Exception:
         return []
     soup = BeautifulSoup(resp.text, "html.parser")
-
-    # Finviz news table is often in a table with class 'fullview-news-outer'
     news_table = soup.find("table", class_="fullview-news-outer")
     results = []
     if not news_table:
-        # fallback: try to locate anchors in the page
+        # fallback: find anchors with quote links or headlines
         for a in soup.find_all("a"):
             txt = a.get_text(strip=True)
-            href = a.get("href")
             if txt and len(txt) > 10:
+                href = a.get("href")
                 link = href if href and href.startswith("http") else ("https://finviz.com/" + href.lstrip("/") if href else "")
                 results.append({"title": txt, "link": link, "source": "finviz", "timestamp": ""})
                 if len(results) >= max_items:
                     break
         return results[:max_items]
 
-    # Finviz uses rows: <tr><td>date/time</td><td><a>headline</a></td></tr>
     for tr in news_table.find_all("tr"):
         tds = tr.find_all("td")
         timestamp = ""
@@ -96,17 +151,15 @@ def parse_finviz(ticker: str, max_items: int = 10) -> List[Dict]:
                     link = href
                 elif href:
                     link = "https://finviz.com/" + href.lstrip("/")
-
         if title:
             results.append({"title": title, "link": link, "source": "finviz", "timestamp": timestamp})
             if len(results) >= max_items:
                 break
-
     return results[:max_items]
 
 def parse_google_news(ticker: str, max_items: int = 10) -> List[Dict]:
     """
-    Use Google News RSS for search query. Parses pubDate where available.
+    Use Google News RSS for the search query.
     """
     query = urllib.parse.quote_plus(ticker)
     url = f"https://news.google.com/rss/search?q={query}"
@@ -114,7 +167,6 @@ def parse_google_news(ticker: str, max_items: int = 10) -> List[Dict]:
         resp = fetch_url(url)
     except Exception:
         return []
-    # preferred xml parser (lxml). fallback to html parser if necessary.
     try:
         soup = BeautifulSoup(resp.content, "xml")
     except Exception:
@@ -245,33 +297,35 @@ def process_ticker(ticker: str, sites: List[str], run_vader: bool, run_finbert: 
 # UI (sidebar & main)
 # -----------------------
 st.title("Stock Ticker News Sentiment (VADER + FinBERT)")
+
 with st.sidebar:
     st.header("Controls")
-    input_mode = st.radio("Input method", ("Manual (text box)", "Upload Excel (single-column)"))
+    input_mode = st.radio("Input method", ("Manual (text)", "Upload Excel (single-column)", "Finviz Screener URL"))
     run_vader = st.checkbox("VADER (fast)", value=True)
     run_finbert = st.checkbox("FinBERT (slower)", value=True)
     sites_multiselect = st.multiselect("News sources", ["finviz", "google"], default=["finviz", "google"])
     max_news = st.number_input("Max headlines per site", min_value=1, max_value=20, value=3)
     max_workers = st.slider("Concurrent workers", 2, 20, 8)
     st.write("---")
-    st.write("Input tickers")
+    st.write("Input tickers / screener")
     tickers = []
+    screener_url = ""
     uploaded_file = None
-    if input_mode == "Manual (text box)":
+    if input_mode == "Manual (text)":
         raw = st.text_area("Tickers (comma, newline or space separated)", placeholder="AAPL, MSFT, TSLA")
         if raw:
             candidates = [t.strip().upper() for t in raw.replace(",", " ").split()]
             tickers = [t for t in candidates if t]
-    else:
+    elif input_mode == "Upload Excel (single-column)":
         uploaded_file = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
         if uploaded_file is not None:
             try:
                 df = pd.read_excel(uploaded_file)
+                # prefer 'ticker' column if present
                 if "ticker" in (c.lower() for c in df.columns):
                     col = next(c for c in df.columns if c.lower() == "ticker")
                     tickers = [str(x).strip().upper() for x in df[col].dropna().astype(str).tolist()]
                 else:
-                    # if single column, use that
                     if df.shape[1] == 1:
                         col = df.columns[0]
                         tickers = [str(x).strip().upper() for x in df[col].dropna().astype(str).tolist()]
@@ -279,6 +333,16 @@ with st.sidebar:
                         st.warning("Uploaded file has multiple columns and no 'ticker' column. Please upload a single-column file or include 'ticker' column named 'ticker'.")
             except Exception as e:
                 st.error(f"Failed to read uploaded file: {e}")
+    else:
+        screener_url = st.text_input("Paste Finviz screener URL (will fetch all pages):", placeholder="https://finviz.com/screener.ashx?v=111&f=...")
+        if screener_url:
+            with st.spinner("Fetching tickers from screener (may take a few seconds)..."):
+                try:
+                    tickers = extract_tickers_from_finviz_screener(screener_url, max_total=MAX_TICKERS)
+                    if not tickers:
+                        st.warning("No tickers found on the provided screener URL.")
+                except Exception as e:
+                    st.error(f"Failed to extract tickers from screener URL: {e}")
     if len(tickers) > MAX_TICKERS:
         st.warning(f"Too many tickers provided; limiting to first {MAX_TICKERS}.")
         tickers = tickers[:MAX_TICKERS]
@@ -299,7 +363,7 @@ if run_button:
         st.error("Select at least one sentiment analyzer.")
     else:
         t0 = time.time()
-        st.info("Fetching headlines and analyzing... (FinBERT may be slow)")
+        st.info("Fetching headlines and analyzing... (FinBERT may be slower)")
 
         # Pre-load models so caching works for threads
         if run_vader:
@@ -342,7 +406,6 @@ if run_button:
         # Column groups: VADER and FINBERT (each cell shows three emoji-balls with counts)
         # -----------------------
         df_res = pd.DataFrame(results).set_index("ticker")
-        # We no longer show percentages per your confirmation.
         display_df = df_res[[
             "vader_pos", "vader_neg", "vader_neu",
             "finbert_pos", "finbert_neg", "finbert_neu",
@@ -359,7 +422,6 @@ if run_button:
             else:
                 return f"<span style='color:gray;font-weight:bold'>{html.escape(ticker)}</span>"
 
-        # Build HTML table with grouped columns
         header = (
             "<tr>"
             "<th style='padding:8px;text-align:left'>Ticker</th>"
@@ -377,6 +439,51 @@ if run_button:
                              f"<td style='padding:6px;text-align:center'>{finbert_cell}</td></tr>")
         summary_table = f"<table style='border-collapse: collapse; width:100%'>{header}{''.join(rows_html)}</table>"
         st.markdown(summary_table, unsafe_allow_html=True)
+
+        # -----------------------
+        # Top Movers (side-by-side): top 3 positive and top 3 negative
+        # -----------------------
+        st.subheader("Top Movers (by total counts)")
+
+        # compute scores
+        movers = []
+        for r in results:
+            pos_total = r.get("vader_pos", 0) + r.get("finbert_pos", 0)
+            neg_total = r.get("vader_neg", 0) + r.get("finbert_neg", 0)
+            movers.append({"ticker": r["ticker"], "pos_total": pos_total, "neg_total": neg_total})
+
+        movers_df = pd.DataFrame(movers)
+
+        top_pos = movers_df.sort_values(by="pos_total", ascending=False).head(3).reset_index(drop=True) if not movers_df.empty else pd.DataFrame()
+        top_neg = movers_df.sort_values(by="neg_total", ascending=False).head(3).reset_index(drop=True) if not movers_df.empty else pd.DataFrame()
+
+        # build two small html tables side by side
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**Top 3 Positive**")
+            table_html = "<table style='border-collapse: collapse; width:100%'><tr><th>Rank</th><th>Ticker</th><th>Total Positive</th></tr>"
+            for i in range(3):
+                if i < len(top_pos):
+                    row = top_pos.loc[i]
+                    ticker_html = ticker_color_style(row["ticker"], {"vader_pos": 0, "vader_neg": 0, "finbert_pos": 0, "finbert_neg": 0})
+                    table_html += f"<tr><td style='padding:6px'>{i+1}</td><td style='padding:6px'>{ticker_html}</td><td style='padding:6px'>{int(row['pos_total'])}</td></tr>"
+                else:
+                    table_html += f"<tr><td style='padding:6px'>{i+1}</td><td style='padding:6px'></td><td style='padding:6px'></td></tr>"
+            table_html += "</table>"
+            st.markdown(table_html, unsafe_allow_html=True)
+
+        with col2:
+            st.markdown("**Top 3 Negative**")
+            table_html = "<table style='border-collapse: collapse; width:100%'><tr><th>Rank</th><th>Ticker</th><th>Total Negative</th></tr>"
+            for i in range(3):
+                if i < len(top_neg):
+                    row = top_neg.loc[i]
+                    ticker_html = ticker_color_style(row["ticker"], {"vader_pos": 0, "vader_neg": 0, "finbert_pos": 0, "finbert_neg": 0})
+                    table_html += f"<tr><td style='padding:6px'>{i+1}</td><td style='padding:6px'>{ticker_html}</td><td style='padding:6px'>{int(row['neg_total'])}</td></tr>"
+                else:
+                    table_html += f"<tr><td style='padding:6px'>{i+1}</td><td style='padding:6px'></td><td style='padding:6px'></td></tr>"
+            table_html += "</table>"
+            st.markdown(table_html, unsafe_allow_html=True)
 
         # -----------------------
         # Detailed headlines table: grouped by ticker and sorted newest -> oldest
@@ -397,13 +504,12 @@ if run_button:
                     "finbert": h.get("finbert", "n/a")
                 })
 
-        # Parse and normalize timestamp to YYYY-MM-DD HH:MM when possible; empty if not
+        # Parse and normalize timestamp into datetime if possible
         def parse_ts(ts_str):
             if not ts_str:
                 return None
             try:
                 dt = date_parser.parse(ts_str, fuzzy=True)
-                # return both dt and formatted string
                 return dt
             except Exception:
                 return None
@@ -416,22 +522,17 @@ if run_button:
         grouped_sorted_rows = []
         for ticker in sorted(grouped.keys()):
             items = grouped[ticker]
-            # attach parsed dt safely
+            # attach parsed dt
             for it in items:
-                it["_dt"] = parse_ts(it.get("timestamp_raw", ""))
-
-            # split into parsed and unparsed
-            with_dt = [x for x in items if isinstance(x.get("_dt"), (pd.Timestamp, type(date_parser.parse('2020-01-01'))))]
-            without_dt = [x for x in items if not isinstance(x.get("_dt"), (pd.Timestamp, type(date_parser.parse('2020-01-01'))))]
-
-            # safely sort with_dt
+                it["_dt"] = parse_ts(it["timestamp_raw"])
+            # split lists
+            with_dt = [x for x in items if x.get("_dt") is not None]
+            without_dt = [x for x in items if x.get("_dt") is None]
             try:
                 with_dt_sorted = sorted(with_dt, key=lambda x: x["_dt"], reverse=True)
             except Exception:
-                with_dt_sorted = with_dt  # fallback to original order if anything weird happens
-
+                with_dt_sorted = with_dt
             grouped_sorted_rows.extend(with_dt_sorted + without_dt)
-
 
         # Build HTML table for details; use emoji balls (no text)
         def ball_for(label):
@@ -454,14 +555,11 @@ if run_button:
         detail_rows_html = []
         for it in grouped_sorted_rows:
             ticker = html.escape(it["ticker"])
-            # formatted timestamp if parsed, else raw (or empty)
             ts_formatted = ""
             if it.get("_dt") is not None:
                 ts_formatted = it["_dt"].strftime("%Y-%m-%d %H:%M")
             else:
                 ts_formatted = html.escape(it.get("timestamp_raw", ""))
-            # try to detect source from link or leave blank (we have source not stored here; but headline link may include source)
-            # To show source column we can examine the link domain
             link = it.get("link") or ""
             source_host = ""
             try:
