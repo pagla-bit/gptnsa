@@ -28,7 +28,6 @@ def load_vader():
 
 @st.cache_resource(show_spinner=True)
 def load_finbert_pipeline():
-    # Hugging Face FinBERT tone model (may download once)
     return pipeline("text-classification", model="yiyanghkust/finbert-tone", device=-1)
 
 # -----------------------
@@ -77,13 +76,9 @@ def extract_tickers_from_finviz_screener(screener_url: str, max_total: int = 500
                         tickers.append(ticker)
                         if len(tickers) >= max_total:
                             break
-        if not page_tickers:
-            break
-        if len(tickers) >= max_total:
+        if not page_tickers or len(tickers) >= max_total or start > 2000:
             break
         start += page_size
-        if start > 2000:
-            break
     return tickers
 
 # -----------------------
@@ -157,12 +152,7 @@ def parse_google_news(ticker: str, max_items: int = 10) -> List[Dict]:
     for item in items[:max_items]:
         title = item.title.get_text(strip=True) if item.title else ""
         link = item.link.get_text(strip=True) if item.link else ""
-        ts = ""
-        if item.pubDate:
-            try:
-                ts = item.pubDate.get_text(strip=True)
-            except Exception:
-                ts = ""
+        ts = item.pubDate.get_text(strip=True) if item.pubDate else ""
         results.append({"title": title, "link": link, "source": "google", "timestamp": ts})
     return results[:max_items]
 
@@ -413,6 +403,54 @@ if run_button:
         st.markdown(summary_table, unsafe_allow_html=True)
 
         # -----------------------
+        # Top Movers
+        # -----------------------
+        st.subheader("Top Movers (by total sentiment counts)")
+        movers = []
+        for r in results:
+            if run_vader and run_finbert:
+                pos_total = r["vader_pos"] + r["finbert_pos"]
+                neg_total = r["vader_neg"] + r["finbert_neg"]
+            elif run_vader:
+                pos_total = r["vader_pos"]
+                neg_total = r["vader_neg"]
+            elif run_finbert:
+                pos_total = r["finbert_pos"]
+                neg_total = r["finbert_neg"]
+            else:
+                pos_total = neg_total = 0
+            movers.append({"ticker": r["ticker"], "pos_total": pos_total, "neg_total": neg_total})
+
+        movers_df = pd.DataFrame(movers)
+        top_pos = movers_df.sort_values("pos_total", ascending=False).head(3).reset_index(drop=True) if not movers_df.empty else pd.DataFrame()
+        top_neg = movers_df.sort_values("neg_total", ascending=False).head(3).reset_index(drop=True) if not movers_df.empty else pd.DataFrame()
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**Top 3 Positive Tickers**")
+            html_pos = "<table style='border-collapse:collapse;width:100%'><tr><th>Rank</th><th>Ticker</th><th>Total Positive</th></tr>"
+            for i in range(3):
+                if i < len(top_pos):
+                    row = top_pos.loc[i]
+                    html_pos += f"<tr><td style='padding:6px'>{i+1}</td><td style='padding:6px'>{html.escape(str(row['ticker']))}</td><td style='padding:6px'>{int(row['pos_total'])}</td></tr>"
+                else:
+                    html_pos += f"<tr><td style='padding:6px'>{i+1}</td><td style='padding:6px'></td><td style='padding:6px'></td></tr>"
+            html_pos += "</table>"
+            st.markdown(html_pos, unsafe_allow_html=True)
+
+        with col2:
+            st.markdown("**Top 3 Negative Tickers**")
+            html_neg = "<table style='border-collapse:collapse;width:100%'><tr><th>Rank</th><th>Ticker</th><th>Total Negative</th></tr>"
+            for i in range(3):
+                if i < len(top_neg):
+                    row = top_neg.loc[i]
+                    html_neg += f"<tr><td style='padding:6px'>{i+1}</td><td style='padding:6px'>{html.escape(str(row['ticker']))}</td><td style='padding:6px'>{int(row['neg_total'])}</td></tr>"
+                else:
+                    html_neg += f"<tr><td style='padding:6px'>{i+1}</td><td style='padding:6px'></td><td style='padding:6px'></td></tr>"
+            html_neg += "</table>"
+            st.markdown(html_neg, unsafe_allow_html=True)
+
+        # -----------------------
         # Detailed headlines (with filter)
         # -----------------------
         st.subheader("All headlines (detailed) — grouped by ticker, newest first")
@@ -444,11 +482,13 @@ if run_button:
         for r in detail_rows:
             if selected_ticker != "All" and r["ticker"] != selected_ticker:
                 continue
-            if search_term and search_term.lower() not in (r["title"].lower() + " " + r["ticker"].lower()):
-                continue
+            if search_term and search_term.strip():
+                st_term = search_term.lower().strip()
+                if st_term not in (r["title"].lower() + " " + r["ticker"].lower()):
+                    continue
             filtered_rows.append(r)
 
-        # Parse timestamps
+        # Parse timestamps safely
         def parse_ts(ts_str):
             if not ts_str:
                 return None
@@ -459,22 +499,27 @@ if run_button:
 
         for r in filtered_rows:
             r["_dt"] = parse_ts(r["timestamp_raw"])
-        filtered_rows.sort(key=lambda x: (x["_dt"] is not None, x["_dt"] or pd.Timestamp.min), reverse=True)
 
-        # Build table
+        # Safe sort: use pandas.Timestamp.min for None fallback
+        filtered_rows.sort(key=lambda x: x["_dt"] or pd.Timestamp.min, reverse=True)
+
+        # Build HTML table for details
         def ball_for(label):
-            if label == "positive": return "🟢"
-            if label == "negative": return "🔴"
-            if label == "neutral": return "🟡"
+            if label == "positive":
+                return "🟢"
+            if label == "negative":
+                return "🔴"
+            if label == "neutral":
+                return "🟡"
             return ""
 
         detail_header = ("<tr>"
-                         "<th>Ticker</th>"
-                         "<th>Timestamp</th>"
-                         "<th>Source</th>"
-                         "<th>Headline</th>"
-                         "<th>VADER</th>"
-                         "<th>FINBERT</th>"
+                         "<th style='padding:8px;text-align:left'>Ticker</th>"
+                         "<th style='padding:8px;text-align:left'>Timestamp</th>"
+                         "<th style='padding:8px;text-align:left'>Source</th>"
+                         "<th style='padding:8px;text-align:left'>Headline</th>"
+                         "<th style='padding:8px;text-align:center'>VADER</th>"
+                         "<th style='padding:8px;text-align:center'>FINBERT</th>"
                          "</tr>")
         detail_rows_html = []
         for it in filtered_rows:
@@ -487,13 +532,22 @@ if run_button:
                 source_host = ""
             source_host = html.escape(source_host)
             title_escaped = html.escape(it.get("title", ""))
-            headline_cell = f"<a href='{html.escape(link, quote=True)}' target='_blank'>{title_escaped}</a>" if link else title_escaped
+            if link:
+                safe_link = html.escape(link, quote=True)
+                headline_cell = f"<a href='{safe_link}' target='_blank' rel='noopener noreferrer'>{title_escaped}</a>"
+            else:
+                headline_cell = title_escaped
             vader_ball = ball_for(it.get("vader", ""))
             finbert_ball = ball_for(it.get("finbert", ""))
             detail_rows_html.append(
-                f"<tr><td>{ticker}</td><td>{ts_formatted}</td><td>{source_host}</td>"
-                f"<td>{headline_cell}</td><td style='text-align:center'>{vader_ball}</td>"
-                f"<td style='text-align:center'>{finbert_ball}</td></tr>"
+                f"<tr>"
+                f"<td style='padding:6px'>{ticker}</td>"
+                f"<td style='padding:6px'>{ts_formatted}</td>"
+                f"<td style='padding:6px'>{source_host}</td>"
+                f"<td style='padding:6px'>{headline_cell}</td>"
+                f"<td style='padding:6px;text-align:center'>{vader_ball}</td>"
+                f"<td style='padding:6px;text-align:center'>{finbert_ball}</td>"
+                f"</tr>"
             )
 
         detail_table = f"<table style='border-collapse: collapse; width:100%'>{detail_header}{''.join(detail_rows_html)}</table>"
